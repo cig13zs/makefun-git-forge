@@ -20,6 +20,9 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 /** One counter for the reply id, so two runs issue the same ids in the same order. */
 let requestCounter = 0;
 
+/** The request headers this server actually reads; anything else is left on the raw request. */
+const READ_HEADERS = ['authorization', 'host', 'git-protocol', 'content-type', 'accept', 'content-length'] as const;
+
 /** Split a path into its non-empty segments. */
 function segmentsOf(path: string): string[] {
   const out: string[] = [];
@@ -54,63 +57,66 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/**
+ * Parse the minimal request value the handlers need. Only the headers this server reads are copied,
+ * and the query is only parsed when the URL actually has one, because every saved microsecond here is
+ * paid two thousand times by the read workload.
+ */
+function parseRequest(raw: IncomingMessage, body: Buffer): Req {
+  const rawUrl = raw.url ?? '/';
+  const mark = rawUrl.indexOf('?');
+  const rawPath = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
+  const path = rawPath.includes('%') ? safeDecode(rawPath) : rawPath;
+
+  const headers: Record<string, string | undefined> = {};
+  for (const name of READ_HEADERS) {
+    const value = raw.headers[name];
+    headers[name] = Array.isArray(value) ? value.join(', ') : value;
+  }
+
+  return {
+    method: (raw.method ?? 'GET').toUpperCase(),
+    path,
+    seg: segmentsOf(path),
+    query: mark < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(mark + 1)),
+    headers,
+    body,
+    origin: `http://${headers.host ?? 'forge.local'}`,
+  };
+}
+
+/** A shared empty query, so a request without one allocates nothing. */
+const EMPTY_QUERY = new URLSearchParams();
+
+/** Decode a path, falling back to the raw text when it is not valid percent-encoding. */
+function safeDecode(path: string): string {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return path;
+  }
+}
+
 /** Build the server. It binds nothing until the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const forge = new Forge();
   const deps: RestDeps = { forge, token: process.env.MAKEFUN_SHOP_TOKEN ?? '' };
 
   const server = createServer((raw: IncomingMessage, res: ServerResponse) => {
-    void (async () => {
-      const started = performance.now();
-      let body = Buffer.alloc(0);
-      try {
-        body = await readBody(raw);
-      } catch {
-        res.writeHead(413, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': `req-${++requestCounter}` });
+    const method = (raw.method ?? 'GET').toUpperCase();
+    // A GET or a HEAD carries no body worth waiting for, and the read and clone workloads are made
+    // almost entirely of them: answering without a promise keeps that path off the event loop.
+    if (method === 'GET' || method === 'HEAD') {
+      respond(deps, raw, res, Buffer.alloc(0));
+      return;
+    }
+    readBody(raw).then(
+      (body) => respond(deps, raw, res, body),
+      () => {
+        res.writeHead(413, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': `REQ-${++requestCounter}` });
         res.end('{"message":"Request Entity Too Large"}\n');
-        return;
-      }
-
-      const rawUrl = raw.url ?? '/';
-      const mark = rawUrl.indexOf('?');
-      const rawPath = mark < 0 ? rawUrl : rawUrl.slice(0, mark);
-      const queryText = mark < 0 ? '' : rawUrl.slice(mark + 1);
-      let path = rawPath;
-      try {
-        path = decodeURIComponent(rawPath);
-      } catch {
-        path = rawPath;
-      }
-      const headers: Record<string, string | undefined> = {};
-      for (const [key, value] of Object.entries(raw.headers)) {
-        headers[key] = Array.isArray(value) ? value.join(', ') : value;
-      }
-      const req: Req = {
-        method: (raw.method ?? 'GET').toUpperCase(),
-        path,
-        seg: segmentsOf(path),
-        query: new URLSearchParams(queryText),
-        headers,
-        body,
-        origin: `http://${headers.host ?? 'forge.local'}`,
-      };
-
-      let out: Out;
-      try {
-        out = route(deps, req);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[forge] ${req.method} ${req.path} failed: ${message}\n`);
-        out = errorJson(500, 'Internal Server Error');
-      }
-
-      const id = `REQ-${++requestCounter}`;
-      const head: Record<string, string | number> = { ...out.headers, 'x-github-request-id': id };
-      if (head['content-length'] === undefined) head['content-length'] = String(out.body.length);
-      res.writeHead(out.status, head);
-      res.end(out.body);
-      void started;
-    })();
+      },
+    );
   });
 
   // A trial is a burst of small requests on a handful of connections: keep them warm.
@@ -118,6 +124,24 @@ export function createApp(): Server {
   server.headersTimeout = 70_000;
   server.maxRequestsPerSocket = 0;
   return server;
+}
+
+/** Route one request and write exactly one buffer back. */
+function respond(deps: RestDeps, raw: IncomingMessage, res: ServerResponse, body: Buffer): void {
+  const req = parseRequest(raw, body);
+  let out: Out;
+  try {
+    out = route(deps, req);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[forge] ${req.method} ${req.path} failed: ${message}\n`);
+    out = errorJson(500, 'Internal Server Error');
+  }
+  const headers = out.headers;
+  headers['x-github-request-id'] = `REQ-${++requestCounter}`;
+  if (headers['content-length'] === undefined) headers['content-length'] = String(out.body.length);
+  res.writeHead(out.status, headers);
+  res.end(out.body);
 }
 
 /** Send one request to the surface that owns its path. */

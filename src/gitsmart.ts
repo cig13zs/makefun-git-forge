@@ -86,6 +86,54 @@ function commitIds(repo: Repo, from: readonly Sha[]): Set<Sha> {
   return seen;
 }
 
+/**
+ * Whether `ancestor` is reachable from `descendant`, stopping the walk the moment it is found. A push
+ * asks this on every ref it moves, so it must not cost a full history walk on the common case: the
+ * caller checks the parent shortcut first, and this only runs when that did not answer.
+ */
+function isAncestor(repo: Repo, ancestor: Sha, descendant: Sha): boolean {
+  if (ancestor === descendant) return true;
+  const seen = new Set<Sha>();
+  const queue: Sha[] = [descendant];
+  while (queue.length > 0) {
+    const sha = queue.pop() as Sha;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    if (sha === ancestor) return true;
+    const obj = repo.objects.get(sha);
+    if (obj === undefined) continue;
+    if (obj.type === 'commit') {
+      for (const parent of parseCommit(obj.data).parents) queue.push(parent);
+    } else if (obj.type === 'tag') {
+      const match = /^object ([0-9a-f]{40})$/m.exec(obj.data.toString('utf8'));
+      if (match !== null) queue.push(match[1] as string);
+    }
+  }
+  return false;
+}
+
+/**
+ * A small cache of the pack bodies this server builds. Objects are content-addressed, so a pack for a
+ * given set of wants and a given shallow cut never changes: the clone workload is fifty concurrent
+ * shallow clones of one repository, and they are all the same pack.
+ */
+const packCache = new Map<string, Buffer>();
+
+/** The pack for `key`, built once and reused. */
+function cachedPack(key: string, build: () => Buffer): Buffer {
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
+  const made = build();
+  if (packCache.size >= 32) packCache.clear();
+  packCache.set(key, made);
+  return made;
+}
+
+/** A stable signature for a set of ids, so the cache key does not depend on request order. */
+function signature(ids: Iterable<Sha>): string {
+  return [...ids].sort().join(',');
+}
+
 /** Every object reachable from `from`, stopping at commits in `boundary` (a shallow cut). */
 function objectsFrom(repo: Repo, from: readonly Sha[], boundary: ReadonlySet<Sha>, into = new Map<Sha, GObj>()): Map<Sha, GObj> {
   const walk = (sha: Sha): void => {
@@ -335,14 +383,17 @@ function v2Fetch(repo: Repo, fetch: FetchArgs): Buffer {
   parts.push(pkt('packfile\n'));
   // A `have` only proves the client holds what it can reach *without crossing its own shallow cut*:
   // the parents beyond that cut are exactly what a deepen is asking for, so the cut is honoured here.
-  const haveObjects = new Set<Sha>();
-  if (fetch.haves.length > 0) {
-    for (const [id] of objectsFrom(repo, fetch.haves, fetch.shallows)) haveObjects.add(id);
-  }
-  const wanted = objectsFrom(repo, fetch.wants, boundary);
-  const send: GObj[] = [];
-  for (const [sha, obj] of wanted) if (!haveObjects.has(sha)) send.push(obj);
-  const pack = writePack(send);
+  const key = `v2|${repo.id}|${signature(fetch.wants)}|${signature(boundary)}|${signature(fetch.haves)}|${signature(fetch.shallows)}`;
+  const pack = cachedPack(key, () => {
+    const haveObjects = new Set<Sha>();
+    if (fetch.haves.length > 0) {
+      for (const [id] of objectsFrom(repo, fetch.haves, fetch.shallows)) haveObjects.add(id);
+    }
+    const wanted = objectsFrom(repo, fetch.wants, boundary);
+    const send: GObj[] = [];
+    for (const [sha, obj] of wanted) if (!haveObjects.has(sha)) send.push(obj);
+    return writePack(send);
+  });
   parts.push(...sideband(1, pack));
   parts.push(FLUSH);
   return Buffer.concat(parts);
@@ -378,14 +429,18 @@ function v0Upload(repo: Repo, body: Buffer): Buffer {
   for (const sha of clientShallows) if (!boundary.has(sha)) parts.push(pkt(`unshallow ${sha}\n`));
   if (boundary.size > 0 || clientShallows.size > 0) parts.push(FLUSH);
   parts.push(pkt('NAK\n'));
-  const haveObjects = new Set<Sha>();
-  if (haves.length > 0) {
-    for (const [id] of objectsFrom(repo, haves, clientShallows)) haveObjects.add(id);
-  }
-  const wanted = objectsFrom(repo, wants, boundary);
-  const send: GObj[] = [];
-  for (const [sha, obj] of wanted) if (!haveObjects.has(sha)) send.push(obj);
-  parts.push(...sideband(1, writePack(send)));
+  const key = `v0|${repo.id}|${signature(wants)}|${signature(boundary)}|${signature(haves)}|${signature(clientShallows)}`;
+  const pack = cachedPack(key, () => {
+    const haveObjects = new Set<Sha>();
+    if (haves.length > 0) {
+      for (const [id] of objectsFrom(repo, haves, clientShallows)) haveObjects.add(id);
+    }
+    const wanted = objectsFrom(repo, wants, boundary);
+    const send: GObj[] = [];
+    for (const [sha, obj] of wanted) if (!haveObjects.has(sha)) send.push(obj);
+    return writePack(send);
+  });
+  parts.push(...sideband(1, pack));
   parts.push(FLUSH);
   return Buffer.concat(parts);
 }
@@ -468,10 +523,12 @@ function receivePack(deps: RestDeps, repo: Repo, body: Buffer): Buffer {
       command.reason = 'missing necessary objects';
       continue;
     }
-    // A non-fast-forward update is refused unless the old tip is an ancestor of the new one.
+    // A non-fast-forward update is refused unless the old tip is an ancestor of the new one. The
+    // parent shortcut answers the ordinary append-only push without walking any history at all.
     if (command.oldSha !== ZERO_SHA) {
-      const ancestors = commitIds(repo, [command.newSha]);
-      if (!ancestors.has(command.oldSha)) {
+      const head = repo.objects.get(command.newSha);
+      const direct = head !== undefined && head.type === 'commit' && parseCommit(head.data).parents.includes(command.oldSha);
+      if (!direct && !isAncestor(repo, command.oldSha, command.newSha)) {
         command.status = 'ng';
         command.reason = 'non-fast-forward';
         continue;
