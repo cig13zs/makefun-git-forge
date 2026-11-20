@@ -425,6 +425,35 @@ function mergeability(forge: Forge, repo: Repo, pull: Pull): { ok: boolean; conf
   return merged.ok ? { ok: true, conflicts: [] } : { ok: false, conflicts: merged.conflicts };
 }
 
+/** The outcome of merging one pull request: the merge commit, or why it could not be made. */
+export type MergeOutcome = { ok: true; sha: Sha } | { ok: false; status: number; message: string };
+
+/**
+ * Merge a pull request into its base branch with a real three-way merge and a real merge commit, and
+ * close the pull. The REST merge route and the MCP merge tool both go through this, so the two
+ * surfaces cannot disagree about what merging means.
+ */
+export function mergePull(forge: Forge, repo: Repo, pull: Pull, commitMessage?: string): MergeOutcome {
+  if (pull.merged) return { ok: false, status: 405, message: 'Pull Request is not mergeable' };
+  const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`);
+  const headSha = repo.refs.get(`refs/heads/${pull.headRef}`);
+  if (baseSha === undefined || headSha === undefined) return { ok: false, status: 405, message: 'Pull Request is not mergeable' };
+  const base = mergeBase(forge, repo, baseSha, headSha);
+  const merged = mergeTrees(forge, repo, base, baseSha, headSha);
+  if (!merged.ok) return { ok: false, status: 405, message: 'Pull Request is not mergeable' };
+  const message = commitMessage !== undefined && commitMessage !== '' ? commitMessage : `Merge pull request #${pull.number} from ${pull.headRef}`;
+  const mergeSha = forge.commitTree(repo, baseSha, merged.files, message, repo.owner, [headSha]);
+  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  if (pull.baseRef === repo.defaultBranch) repo.refs.set(`refs/heads/${repo.defaultBranch}`, mergeSha);
+  pull.state = 'closed';
+  pull.merged = true;
+  pull.mergedAt = forge.stampOf(repo);
+  pull.mergeCommitSha = mergeSha;
+  pull.baseSha = mergeSha;
+  pull.updatedAt = repo.updatedAt;
+  return { ok: true, sha: mergeSha };
+}
+
 // ---------------------------------------------------------------------------- the routes
 
 /**
@@ -1037,26 +1066,11 @@ function pulls(deps: RestDeps, req: Req, repo: Repo, rest: string[]): Out {
   }
 
   if (rest[1] === 'merge' && req.method === 'PUT') {
-    if (pull.merged) return errorJson(405, 'Pull Request is not mergeable');
-    const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`);
-    const headSha = repo.refs.get(`refs/heads/${pull.headRef}`);
-    if (baseSha === undefined || headSha === undefined) return errorJson(405, 'Pull Request is not mergeable');
-    const base = mergeBase(forge, repo, baseSha, headSha);
-    const merged = mergeTrees(forge, repo, base, baseSha, headSha);
-    if (!merged.ok) return errorJson(405, 'Pull Request is not mergeable');
     const body = parseBody(req);
     const method = typeof body?.merge_method === 'string' ? body.merge_method : 'merge';
-    const message = typeof body?.commit_message === 'string' && body.commit_message !== '' ? body.commit_message : `Merge pull request #${pull.number} from ${pull.headRef}`;
-    const mergeSha = forge.commitTree(repo, baseSha, merged.files, message, repo.owner, [baseSha, headSha]);
-    repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
-    if (pull.baseRef === repo.defaultBranch) repo.refs.set(`refs/heads/${repo.defaultBranch}`, mergeSha);
-    pull.state = 'closed';
-    pull.merged = true;
-    pull.mergedAt = forge.stampOf(repo);
-    pull.mergeCommitSha = mergeSha;
-    pull.baseSha = mergeSha;
-    pull.updatedAt = repo.updatedAt;
-    return json(200, { sha: mergeSha, merged: true, message: 'Pull Request successfully merged', merge_method: method });
+    const outcome = mergePull(forge, repo, pull, typeof body?.commit_message === 'string' ? body.commit_message : undefined);
+    if (!outcome.ok) return errorJson(outcome.status, outcome.message);
+    return json(200, { sha: outcome.sha, merged: true, message: 'Pull Request successfully merged', merge_method: method });
   }
 
   if (rest[1] === 'commits' && req.method === 'GET') {
