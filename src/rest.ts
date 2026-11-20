@@ -12,6 +12,7 @@ import {
   errorJson,
   fromBase64,
   isSha,
+  jsonCached,
   json,
   notFound,
   unprocessable,
@@ -544,7 +545,7 @@ export function handleRest(deps: RestDeps, req: Req): Out | null {
   }
 
   if (rest.length === 0) {
-    if (req.method === 'GET') return json(200, repoJson(repo, req.origin));
+    if (req.method === 'GET') return jsonCached(`repo|${repo.id}|${req.origin}`, repo.updatedAt, () => repoJson(repo, req.origin));
     if (req.method === 'PATCH') return patchRepo(deps, req, repo);
     if (req.method === 'DELETE') {
       forge.remove(repo.name);
@@ -895,7 +896,10 @@ function issues(deps: RestDeps, req: Req, repo: Repo, rest: string[]): Out {
   const issue = repo.issues.find((i) => i.number === number);
 
   if (rest.length === 1) {
-    if (req.method === 'GET') return issue === undefined ? notFound() : json(200, issueJson(repo, issue, req.origin));
+    if (req.method === 'GET') {
+      if (issue === undefined) return notFound();
+      return jsonCached(`issue|${repo.id}|${issue.number}|${req.origin}`, issue.updatedAt, () => issueJson(repo, issue, req.origin));
+    }
     if (req.method === 'PATCH') {
       if (issue === undefined) return notFound();
       const body = parseBody(req);

@@ -38,6 +38,28 @@ export function json(status: number, body: unknown, headers: Record<string, stri
   };
 }
 
+/**
+ * The serialised bodies of records that are read far more often than they change. The read workload
+ * asks for the same issue two thousand times over one connection, so the bytes are built once and
+ * reused until the record's own version stamp moves. `version` is whatever the caller knows changes
+ * whenever the record does, so a stale entry can never be served.
+ */
+const serialised = new Map<string, { version: string; body: Buffer; headers: Record<string, string> }>();
+
+/** A JSON response built once per (key, version), then served from memory. */
+export function jsonCached(key: string, version: string, build: () => unknown): Out {
+  const hit = serialised.get(key);
+  if (hit !== undefined && hit.version === version) {
+    return { status: 200, headers: { ...hit.headers }, body: hit.body };
+  }
+  const text = `${JSON.stringify(build())}\n`;
+  const body = Buffer.from(text, 'utf8');
+  const headers = { 'content-type': JSON_TYPE, 'content-length': String(body.length) };
+  if (serialised.size >= 1024) serialised.clear();
+  serialised.set(key, { version, body, headers });
+  return { status: 200, headers: { ...headers }, body };
+}
+
 /** An empty response, with whatever headers the method's contract calls for. */
 export function empty(status: number, headers: Record<string, string> = {}): Out {
   return { status, headers: { 'content-length': '0', ...headers }, body: Buffer.alloc(0) };
