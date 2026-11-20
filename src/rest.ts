@@ -415,7 +415,7 @@ function mergeTrees(
 }
 
 /** Whether a pull request can be merged right now. */
-function mergeability(forge: Forge, repo: Repo, pull: Pull): { ok: boolean; conflicts: string[] } {
+export function mergeability(forge: Forge, repo: Repo, pull: Pull): { ok: boolean; conflicts: string[] } {
   const baseSha = repo.refs.get(`refs/heads/${pull.baseRef}`);
   if (baseSha === undefined) return { ok: false, conflicts: [] };
   const headSha = repo.refs.get(`refs/heads/${pull.headRef}`);
@@ -423,6 +423,12 @@ function mergeability(forge: Forge, repo: Repo, pull: Pull): { ok: boolean; conf
   const base = mergeBase(forge, repo, baseSha, headSha);
   const merged = mergeTrees(forge, repo, base, baseSha, headSha);
   return merged.ok ? { ok: true, conflicts: [] } : { ok: false, conflicts: merged.conflicts };
+}
+
+/** The files a pull request changes, measured from the commit the two sides last shared. */
+export function pullFiles(forge: Forge, repo: Repo, pull: Pull): FileChange[] {
+  const base = mergeBase(forge, repo, pull.baseSha, pull.headSha);
+  return diffCommits(forge, repo, base, pull.headSha);
 }
 
 /** The outcome of merging one pull request: the merge commit, or why it could not be made. */
